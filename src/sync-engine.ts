@@ -40,10 +40,10 @@ export class SyncEngine {
     private readonly report: (message: string) => void
   ) {}
 
-  async sync(): Promise<void> {
+  async sync(): Promise<boolean> {
     if (this.running) {
       this.rerunRequested = true;
-      return;
+      return false;
     }
     this.running = true;
     try {
@@ -54,6 +54,46 @@ export class SyncEngine {
     } finally {
       this.running = false;
     }
+    return true;
+  }
+
+  async pullFromServer(): Promise<number> {
+    if (this.running) {
+      throw new Error("已有同步任务正在运行，请稍后重试");
+    }
+    this.running = true;
+    try {
+      const data = this.getData();
+      validateConfiguration(data);
+      const keys = await createVaultCrypto(data.settings.rootKey);
+      const api = new SyncApi(data.settings);
+      this.report("正在重新读取服务器上的 Vault 状态…");
+
+      data.files = {};
+      data.lastSequence = 0;
+      await this.saveData();
+      await this.pullAll(api, keys, data);
+
+      const liveFiles = Object.values(data.files).filter((file) => !file.deleted).length;
+      this.report(`服务器拉取完成，共连接 ${liveFiles} 个文件`);
+      return liveFiles;
+    } finally {
+      this.running = false;
+    }
+  }
+
+  async testConnection(): Promise<{ files: number; sequence: number }> {
+    const data = this.getData();
+    validateConfiguration(data);
+    const keys = await createVaultCrypto(data.settings.rootKey);
+    const api = new SyncApi(data.settings);
+    await api.health();
+    const state = await api.state("");
+    if (state.files.length > 0) {
+      const first = state.files[0];
+      await decryptPath(keys, first.encryptedPath, first.pathKey);
+    }
+    return { files: state.files.length, sequence: state.currentSequence };
   }
 
   private async syncOnce(): Promise<void> {

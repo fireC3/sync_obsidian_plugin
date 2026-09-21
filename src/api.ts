@@ -72,8 +72,9 @@ export class SyncApi {
   }
 
   async commit(changes: CommitChange[]): Promise<CommitResponse> {
+    const deviceLabel = `${this.settings.deviceName}:${this.settings.deviceId}`.slice(0, 128);
     return this.jsonRequest("POST", `${this.vaultPath()}/commit`, {
-      deviceId: this.settings.deviceId,
+      deviceId: deviceLabel,
       changes
     }) as Promise<CommitResponse>;
   }

@@ -4,6 +4,7 @@ export interface SyncSettings {
   vaultId: string;
   rootKey: string;
   deviceId: string;
+  deviceName: string;
   autoSync: boolean;
   debounceSeconds: number;
   syncObsidianConfig: boolean;
@@ -22,6 +23,14 @@ export interface PluginData {
   settings: SyncSettings;
   files: Record<string, LocalFileState>;
   lastSequence: number;
+  lastSuccessfulSync?: number;
+  logs: SyncLogEntry[];
+}
+
+export interface SyncLogEntry {
+  timestamp: number;
+  level: "info" | "error";
+  message: string;
 }
 
 export interface RemoteChange {
