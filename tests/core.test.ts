@@ -69,3 +69,23 @@ function pseudoRandomBytes(length: number): Uint8Array {
   }
   return result;
 }
+
+
+test("local credentials are authenticated ciphertext, with random salt/nonce and nonexportable keys", async () => {
+  const { createProtection, sealCredentials, openCredentials } = await import('../src/credentials');
+  const credentials = { token: 'test-only-token', rootKey: generateRootKey() };
+  const password = 'test-only-local-password';
+  const protection = await createProtection(password);
+  assert.equal(protection.key.extractable, false);
+  const first = await sealCredentials(credentials, protection.key, protection.salt);
+  const second = await sealCredentials(credentials, protection.key, protection.salt);
+  assert.notEqual(first.iv, second.iv); assert.notEqual(first.ciphertext, second.ciphertext);
+  assert.ok(!JSON.stringify(first).includes(credentials.token));
+  assert.ok(!JSON.stringify(first).includes(credentials.rootKey));
+  assert.ok(!JSON.stringify(first).includes(password));
+  assert.deepEqual((await openCredentials(first, password)).credentials, credentials);
+  await assert.rejects(openCredentials(first, 'wrong-password'));
+  await assert.rejects(openCredentials({ ...first, ciphertext: (first.ciphertext[0] === 'A' ? 'B' : 'A') + first.ciphertext.slice(1) }, password));
+  await assert.rejects(openCredentials({ ...first, iterations: 1 } as any, password));
+  await assert.rejects(createProtection('short'));
+});

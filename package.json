@@ -1,12 +1,13 @@
 {
   "name": "obsidian-encrypted-sync",
-  "version": "0.2.0",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc --noEmit && node esbuild.config.mjs production",
-    "test": "node test.config.mjs"
+    "test": "node test.config.mjs",
+    "test:integration": "SYNC_INTEGRATION=1 node test.config.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

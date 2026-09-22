@@ -1,4 +1,4 @@
-import { App, normalizePath } from "obsidian";
+import { App, TFile, normalizePath } from "obsidian";
 import { SyncApi } from "./api";
 import { chunkRanges } from "./chunker";
 import {
@@ -183,12 +183,17 @@ export class SyncEngine {
     }
 
     const localPath = state?.path ?? remotePath;
-    const localExists = await this.app.vault.adapter.exists(localPath);
-    const localBytes = localExists
-      ? new Uint8Array(await this.app.vault.adapter.readBinary(localPath))
-      : undefined;
-    const localHash = localBytes === undefined ? "" : await hashBytes(localBytes);
     if (remote.deleted) {
+      // A historical tombstone does not own an untracked/recreated local path.
+      const owned = state !== undefined && !state.deleted && !Object.values(data.files).some(
+        other => other.fileId !== remote.fileId && !other.deleted && other.path === localPath
+      );
+      const localExists = owned && await this.app.vault.adapter.exists(localPath);
+      const localBytes = localExists
+        ? new Uint8Array(await this.app.vault.adapter.readBinary(localPath))
+        : undefined;
+      const localHash = localBytes === undefined ? "" : await hashBytes(localBytes);
+
       const localDirty =
         state === undefined
           ? localExists
@@ -201,7 +206,7 @@ export class SyncEngine {
         this.report(`远端删除与本地修改冲突，已保留本地副本：${conflictPath}`);
       }
       if (localExists) {
-        await this.app.vault.adapter.remove(localPath);
+        await this.removeFile(localPath);
       }
       data.files[remote.fileId] = {
         fileId: remote.fileId,
@@ -222,6 +227,12 @@ export class SyncEngine {
       throw new Error(`文件 ${remotePath} 的大小与远端清单不一致`);
     }
     const remoteHash = await hashBytes(remoteBytes);
+    const localExists = await this.app.vault.adapter.exists(localPath);
+    const localBytes = localExists
+      ? new Uint8Array(await this.app.vault.adapter.readBinary(localPath))
+      : undefined;
+    const localHash = localBytes === undefined ? "" : await hashBytes(localBytes);
+
     const localDirty =
       state === undefined
         ? localExists && localHash !== remoteHash
@@ -237,13 +248,18 @@ export class SyncEngine {
       this.report(`远端修改与本地删除冲突，已保留远端版本：${remotePath}`);
     }
 
-    if (state !== undefined && state.path !== remotePath) {
-      const oldExists = await this.app.vault.adapter.exists(state.path);
-      if (oldExists) {
-        await this.app.vault.adapter.remove(state.path);
+    let expectedDestination = localPath === remotePath ? localBytes : undefined;
+    if (localPath !== remotePath && await this.app.vault.adapter.exists(remotePath)) {
+      const destination = new Uint8Array(await this.app.vault.adapter.readBinary(remotePath));
+      expectedDestination = destination;
+      if (await hashBytes(destination) !== remoteHash) {
+        await this.writeFile(await this.conflictPath(remotePath, remote.deviceId), destination);
       }
     }
-    await this.writeFile(remotePath, remoteBytes);
+    await this.writeFile(remotePath, remoteBytes, expectedDestination);
+    if (state !== undefined && state.path !== remotePath && await this.app.vault.adapter.exists(state.path)) {
+      await this.removeFile(state.path);
+    }
     state = {
       fileId: remote.fileId,
       path: remotePath,
@@ -255,7 +271,7 @@ export class SyncEngine {
   }
 
   private async scanLocal(data: PluginData): Promise<Map<string, ObservedFile>> {
-    const paths = await this.listFiles("");
+    const paths = await this.listFiles("", data);
     const observed = new Map<string, ObservedFile>();
     for (const rawPath of paths.sort()) {
       const path = normalizePath(rawPath);
@@ -268,7 +284,7 @@ export class SyncEngine {
         path,
         hash: await hashBytes(bytes),
         size: bytes.length,
-        modifiedMs: stat?.mtime ?? Date.now()
+        modifiedMs: Math.trunc(stat?.mtime ?? Date.now())
       });
     }
     return observed;
@@ -293,7 +309,7 @@ export class SyncEngine {
         );
         if (state !== undefined) {
           previousPath = state.path;
-          state.path = file.path;
+          state = { ...state, path: file.path };
         }
       }
       if (state === undefined) {
@@ -350,7 +366,7 @@ export class SyncEngine {
           path: item.observed.path,
           hash: await hashBytes(bytes),
           size: bytes.length,
-          modifiedMs: stat?.mtime ?? Date.now()
+          modifiedMs: Math.trunc(stat?.mtime ?? Date.now())
         };
         for (const range of chunkRanges(bytes)) {
           const chunk = bytes.slice(range.start, range.end);
@@ -387,6 +403,7 @@ export class SyncEngine {
       if (item === undefined) {
         continue;
       }
+      data.files[item.state.fileId] = item.state;
       item.state.baseVersion = applied.version;
       item.state.deleted = item.deleted;
       item.state.syncedHash = item.deleted ? "" : item.observed?.hash ?? "";
@@ -397,7 +414,7 @@ export class SyncEngine {
       if (item === undefined) {
         continue;
       }
-      if (conflict.current !== undefined) {
+      if (conflict.current != null) {
         await this.applyRemote(api, keys, data, conflict.current);
       } else {
         await this.preserveRejectedPath(data, item, conflict.reason);
@@ -414,20 +431,22 @@ export class SyncEngine {
       const bytes = new Uint8Array(await this.app.vault.adapter.readBinary(item.state.path));
       const conflictPath = await this.conflictPath(item.state.path, "server");
       await this.writeFile(conflictPath, bytes);
-      await this.app.vault.adapter.remove(item.state.path);
+      await this.removeFile(item.state.path);
       delete data.files[item.state.fileId];
       this.report(`服务器拒绝路径（${reason}），内容已保留为：${conflictPath}`);
     }
   }
 
-  private async listFiles(directory: string): Promise<string[]> {
+  private async listFiles(directory: string, data: PluginData): Promise<string[]> {
     const listing = await this.app.vault.adapter.list(directory);
-    const nested = await Promise.all(listing.folders.map((folder) => this.listFiles(folder)));
+    const nested = await Promise.all(listing.folders.filter(folder => this.shouldSync(`${folder}/__sync_probe__`, data)).map((folder) => this.listFiles(folder, data)));
     return [...listing.files, ...nested.flat()];
   }
 
   private shouldSync(path: string, data: PluginData): boolean {
-    const normalized = normalizePath(path);
+    const configDir = this.app.vault.configDir || ".obsidian";
+    const normalized = normalizePath(path).replace(new RegExp("^" + configDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "/"), ".obsidian/");
+    if (normalized.split("/").some(part => part.startsWith(".") && part !== ".obsidian")) return false;
     if (
       normalized === ".obsidian/plugins/obsidian-encrypted-sync" ||
       normalized.startsWith(".obsidian/plugins/obsidian-encrypted-sync/") ||
@@ -470,7 +489,24 @@ export class SyncEngine {
     return candidate;
   }
 
-  private async writeFile(path: string, bytes: Uint8Array): Promise<void> {
+  private async removeFile(path: string): Promise<void> {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file instanceof TFile) await this.app.vault.trash(file, false);
+    else await this.app.vault.adapter.trashLocal(path);
+  }
+
+  private async writeFile(path: string, bytes: Uint8Array, expected?: Uint8Array): Promise<void> {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file instanceof TFile && file.extension === "md" && expected !== undefined) {
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      const before = decoder.decode(expected);
+      const after = decoder.decode(bytes);
+      await this.app.vault.process(file, current => {
+        if (current !== before) throw new Error("文件在下载时继续修改，已保留本地内容，稍后重试同步");
+        return after;
+      });
+      return;
+    }
     const pieces = normalizePath(path).split("/");
     pieces.pop();
     let directory = "";
@@ -480,7 +516,22 @@ export class SyncEngine {
         await this.app.vault.adapter.mkdir(directory);
       }
     }
-    await this.app.vault.adapter.writeBinary(path, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
+    // Recheck attachments/config too; a concurrent write is retried, not overwritten.
+    const exists = await this.app.vault.adapter.exists(path);
+    if (exists) {
+      const current = new Uint8Array(await this.app.vault.adapter.readBinary(path));
+      if (expected === undefined || await hashBytes(current) !== await hashBytes(expected)) {
+        throw new Error("文件在同步时发生变化，已保留本地内容，稍后重试同步");
+      }
+    } else if (expected !== undefined) {
+      throw new Error("文件在同步时被删除，稍后重试同步");
+    }
+    const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    if (!exists && !path.split("/").some(part => part.startsWith("."))) {
+      await this.app.vault.createBinary(path, buffer);
+    } else {
+      await this.app.vault.adapter.writeBinary(path, buffer);
+    }
   }
 }
 
@@ -489,7 +540,12 @@ function validateConfiguration(data: PluginData): void {
   if (!settings.serverUrl || !settings.token || !settings.vaultId || !settings.rootKey) {
     throw new Error("请先完整配置服务器地址、令牌、Vault ID 和根密钥");
   }
-  if (!/^https:\/\//i.test(settings.serverUrl) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(settings.serverUrl)) {
+  let url: URL;
+  try { url = new URL(settings.serverUrl); } catch { throw new Error("服务器地址无效"); }
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error("服务器地址不能包含用户名、密码、查询参数或片段；请使用独立访问令牌");
+  }
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))) {
     throw new Error("远程服务器必须使用 HTTPS");
   }
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(settings.vaultId)) {
@@ -502,6 +558,8 @@ function isSafeRelativePath(path: string): boolean {
     path.length > 0 &&
     !path.startsWith("/") &&
     !path.includes("\0") &&
+    !path.includes("\\") &&
+    !path.includes(":") &&
     !path.split("/").some((part) => part === ".." || part === ".")
   );
 }

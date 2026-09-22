@@ -5,7 +5,8 @@ import { pathToFileURL } from "node:url";
 const outfile = `/tmp/obsidian-encrypted-sync-test-${process.pid}.mjs`;
 try {
   await esbuild.build({
-    entryPoints: ["tests/core.test.ts"],
+    entryPoints: [process.env.SYNC_INTEGRATION ? "tests/sync.test.ts" : "tests/core.test.ts"],
+    alias: { obsidian: new URL("./tests/obsidian.ts", import.meta.url).pathname },
     bundle: true,
     platform: "node",
     format: "esm",

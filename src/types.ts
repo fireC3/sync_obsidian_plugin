@@ -1,3 +1,4 @@
+import type { EncryptedCredentials } from "./credentials";
 export interface SyncSettings {
   serverUrl: string;
   token: string;
@@ -6,7 +7,6 @@ export interface SyncSettings {
   deviceId: string;
   deviceName: string;
   autoSync: boolean;
-  debounceSeconds: number;
   syncObsidianConfig: boolean;
   excludedPrefixes: string;
 }
@@ -20,6 +20,12 @@ export interface LocalFileState {
 }
 
 export interface PluginData {
+  /** Legacy reference, retained only until encrypted migration is complete. */
+  secretId?: string;
+  account?: { userId: string; username: string; expiresMs: number };
+  vaultName?: string;
+  legacyBackup?: { serverUrl: string; vaultId: string; encryptedCredentials: EncryptedCredentials };
+  encryptedCredentials?: EncryptedCredentials;
   settings: SyncSettings;
   files: Record<string, LocalFileState>;
   lastSequence: number;
@@ -84,7 +90,7 @@ export interface CommitResponse {
     opId: string;
     fileId: string;
     reason: string;
-    current?: RemoteChange;
+    current?: RemoteChange | null;
   }>;
 }
 
@@ -93,4 +99,17 @@ export interface ObservedFile {
   hash: string;
   size: number;
   modifiedMs: number;
+}
+
+export interface AccountSession {
+  token: string;
+  userId: string;
+  username: string;
+  expiresMs: number;
+}
+export interface RemoteVault {
+  id: string;
+  name: string;
+  encryptedKey: EncryptedCredentials;
+  createdMs: number;
 }
