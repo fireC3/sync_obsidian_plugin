@@ -4,6 +4,7 @@ import type { Credentials } from "./credentials";
 import { createProtection, openCredentials, sealCredentials } from "./credentials";
 import { generateRootKey } from "./crypto";
 import { SyncEngine } from "./sync-engine";
+import { RemoteNotifications } from "./notifications";
 import type { AccountSession, RemoteVault, PluginData, SyncLogEntry, SyncSettings } from "./types";
 
 const DEFAULT_SETTINGS: SyncSettings = {
@@ -35,6 +36,9 @@ export default class EncryptedSyncPlugin extends Plugin {
   private wrappingSalt = "";
   private engine!: SyncEngine;
   private debounceTimer?: number;
+  private retryTimer?: number;
+  private syncPending = false;
+  private notifications?: RemoteNotifications;
   private syncBusy = false;
   private disposed = false;
   private retryAt = 0;
@@ -99,11 +103,32 @@ export default class EncryptedSyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("modify", schedule));
     this.registerEvent(this.app.vault.on("delete", schedule));
     this.registerEvent(this.app.vault.on("rename", schedule));
-    // Remote checks must never be postponed by local typing.
+    this.notifications = new RemoteNotifications(
+      () => this.scheduleSync(0),
+      status => {
+        this.data.settings.autoSync = false;
+        if (status === 401) {
+          if (this.accountSession?.token === this.data.settings.token) this.accountSession = undefined;
+          this.data.settings.token = "";
+          if (this.data.account) this.data.account.expiresMs = 0;
+        }
+        this.recordLog(status === 401 ? "登录已失效，请在设置中重新登录" : "远端仓库无权访问，请重新选择仓库", "error");
+        this.updateNotifications();
+        this.updateIdleStatus();
+        void this.persist().catch(error => this.recordLog(`保存登录状态失败：${String(error)}`, "error"));
+      }
+    );
+    // Push triggers prompt pulls; polling repairs missed notifications and
+    // keeps working with older servers or proxies that block WebSocket.
     this.registerInterval(window.setInterval(() => {
       if (Date.now() >= this.retryAt) this.scheduleSync(0);
-    }, 5000));
-    const resume = (): void => { this.retryAt = 0; this.scheduleSync(0); };
+    }, 60000));
+    const resume = (): void => {
+      this.retryAt = 0;
+      this.updateNotifications();
+      this.notifications?.reconnect();
+      this.scheduleSync(0);
+    };
     this.registerDomEvent(window, "online", resume);
     this.registerDomEvent(window, "focus", resume);
     this.registerDomEvent(document, "visibilitychange", () => {
@@ -118,6 +143,8 @@ export default class EncryptedSyncPlugin extends Plugin {
 
   onunload(): void {
     this.disposed = true;
+    this.notifications?.stop();
+    if (this.retryTimer !== undefined) window.clearTimeout(this.retryTimer);
     if (this.debounceTimer !== undefined) {
       window.clearTimeout(this.debounceTimer);
     }
@@ -177,6 +204,7 @@ export default class EncryptedSyncPlugin extends Plugin {
       this.data = previous;
       this.wrappingKey = undefined;
       this.wrappingSalt = "";
+      this.updateNotifications();
       throw error;
     } finally { this.syncBusy = false; }
     this.scheduleSync(0);
@@ -193,10 +221,15 @@ export default class EncryptedSyncPlugin extends Plugin {
       this.wrappingSalt = protection.salt;
       await this.persist();
     } catch (error) { this.wrappingKey = oldKey; this.wrappingSalt = oldSalt; throw error; }
-    finally { this.syncBusy = false; }
+    finally {
+      this.syncBusy = false;
+      this.updateNotifications();
+      if (this.syncPending) { this.syncPending = false; this.scheduleSync(0); }
+    }
   }
 
   async persist(): Promise<void> {
+    this.updateNotifications();
     if (!this.wrappingKey) return;
     // Serialize encryption and disk writes together to preserve snapshot order.
     const key = this.wrappingKey;
@@ -221,7 +254,10 @@ export default class EncryptedSyncPlugin extends Plugin {
   }
 
   scheduleSync(seconds = 1): void {
+    this.updateNotifications();
     if (this.isLocked || this.disposed || !this.data.settings.autoSync || !this.data.settings.token || !this.data.settings.rootKey) return;
+    if (this.syncBusy) { this.syncPending = true; return; }
+    if (Date.now() < this.retryAt) { this.armRetry(); return; }
     if (seconds === 0) {
       if (this.debounceTimer !== undefined) window.clearTimeout(this.debounceTimer);
       this.debounceTimer = undefined;
@@ -234,6 +270,30 @@ export default class EncryptedSyncPlugin extends Plugin {
       this.debounceTimer = undefined;
       if (Date.now() >= this.retryAt) void this.runSync(false);
     }, seconds * 1000);
+  }
+
+  private updateNotifications(): void {
+    if (!this.notifications) return;
+    const settings = this.data.settings;
+    if (this.disposed || this.isLocked || !settings.autoSync || !settings.token || !settings.rootKey) {
+      this.notifications.stop();
+      this.syncPending = false;
+      if (this.retryTimer !== undefined) window.clearTimeout(this.retryTimer);
+      this.retryTimer = undefined;
+      return;
+    }
+    try {
+      this.notifications.configure({ url: new SyncApi(settings).eventsUrl(), token: settings.token });
+    } catch { this.notifications.stop(); }
+  }
+
+  private armRetry(): void {
+    if (this.disposed || this.isLocked || !this.data.settings.autoSync || !this.data.settings.token) return;
+    if (this.retryTimer !== undefined) window.clearTimeout(this.retryTimer);
+    this.retryTimer = window.setTimeout(() => {
+      this.retryTimer = undefined;
+      this.scheduleSync(0);
+    }, Math.max(0, this.retryAt - Date.now()));
   }
 
   private accountApi(): SyncApi {
@@ -354,6 +414,8 @@ export default class EncryptedSyncPlugin extends Plugin {
   async runSync(manual: boolean): Promise<void> {
     if (this.isLocked) { if (manual) new UnlockModal(this).open(); return; }
     if (this.disposed || this.syncBusy || (!manual && !this.data.settings.autoSync)) return;
+    if (this.retryTimer !== undefined) window.clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
     this.syncBusy = true;
     this.setStatus("↻ 正在同步", "running");
     this.recordLog(manual ? "开始手动双向同步" : "开始自动双向同步");
@@ -386,7 +448,13 @@ export default class EncryptedSyncPlugin extends Plugin {
       this.retryAt = Date.now() + Math.min(60000, 5000 * 2 ** Math.min(this.failures - 1, 4));
       if (manual) new Notice(`同步失败：${message}`, 10000);
     } finally {
-      try { await this.persist(); } finally { this.syncBusy = false; }
+      try { await this.persist(); } finally {
+        this.syncBusy = false;
+        const pending = this.syncPending;
+        this.syncPending = false;
+        if (this.retryAt > Date.now()) this.armRetry();
+        else if (pending) this.scheduleSync(0);
+      }
     }
   }
 
@@ -565,7 +633,7 @@ class SyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("自动同步")
-      .setDesc("启动、联网和返回窗口时立即同步；持续检查远端变化。关闭后暂停自动同步。")
+      .setDesc("接收远端更新通知后立即同步，每分钟检查一次遗漏；启动、联网和返回窗口时补同步。关闭后暂停自动同步。")
       .addToggle((toggle) =>
         toggle.setValue(settings.autoSync).onChange(async (value) => {
           settings.autoSync = value;

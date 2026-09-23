@@ -35,6 +35,12 @@ export class SyncApi {
     await this.jsonRequest("GET", "/api/v1/health", undefined, false);
   }
 
+  eventsUrl(): string {
+    const url = new URL(`${this.baseUrl}${this.vaultPath()}/events`);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    return url.toString();
+  }
+
   async changes(after: number): Promise<ChangesResponse> {
     return this.jsonRequest(
       "GET",

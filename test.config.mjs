@@ -1,11 +1,17 @@
 import esbuild from "esbuild";
 import { unlink } from "node:fs/promises";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const outfile = `/tmp/obsidian-encrypted-sync-test-${process.pid}.mjs`;
 try {
   await esbuild.build({
-    entryPoints: [process.env.SYNC_INTEGRATION ? "tests/sync.test.ts" : "tests/core.test.ts"],
+    stdin: {
+      contents: process.env.SYNC_INTEGRATION
+        ? 'import "./tests/sync.test.ts";'
+        : 'import "./tests/core.test.ts"; import "./tests/notifications.test.ts";',
+      resolveDir: fileURLToPath(new URL(".", import.meta.url)),
+      loader: "ts"
+    },
     alias: { obsidian: new URL("./tests/obsidian.ts", import.meta.url).pathname },
     bundle: true,
     platform: "node",

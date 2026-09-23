@@ -11,6 +11,7 @@ import EncryptedSyncPlugin from "../src/main";
 import { generateRootKey } from "../src/crypto";
 import { interceptRequest, TFile } from "obsidian";
 import type { PluginData } from "../src/types";
+import { RemoteNotifications } from "../src/notifications";
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function makeClient(root: string, serverUrl: string, token: string, rootKey: string, vaultId: string) {
@@ -45,7 +46,7 @@ test('two vaults against the real Rust server: common sync and recovery scenario
   await new Promise<void>(r => socket.close(() => r()));
   const url = `http://127.0.0.1:${port}`;
   const legacyToken = crypto.randomUUID();
-  const server = spawn(resolve('../ObsidianBackupServer/target/debug/obsidian-backup-server'), [], { env: { ...process.env, OBS_BACKUP_TOKEN: legacyToken, OBS_BACKUP_LISTEN: `127.0.0.1:${port}`, OBS_BACKUP_DATA_DIR: join(root, 'server'), RUST_LOG: 'error' }, stdio: 'ignore' });
+  const server = spawn(resolve('../obsidian_sync_server/target/debug/obsidian-backup-server'), [], { env: { ...process.env, OBS_BACKUP_TOKEN: legacyToken, OBS_BACKUP_LISTEN: `127.0.0.1:${port}`, OBS_BACKUP_DATA_DIR: join(root, 'server'), RUST_LOG: 'error' }, stdio: 'ignore' });
   t.after(async () => { interceptRequest(); server.kill(); await rm(root, { recursive: true, force: true }); });
   for (let n = 0; ; n++) { try { await fetch(url + '/api/v1/health'); break; } catch (e) { if (n > 100) throw e; await delay(30); } }
   async function request(path: string, method = 'GET', body?: unknown, token?: string) {
@@ -66,6 +67,23 @@ test('two vaults against the real Rust server: common sync and recovery scenario
   const vaultId = registered.id;
   const a = await makeClient(join(root, 'A'), url, token, key, vaultId);
   const b = await makeClient(join(root, 'B'), url, token, key, vaultId);
+  const eventUrl = (id: string) => `${url.replace('http:', 'ws:')}/api/v1/vaults/${id}/events`;
+  async function until(check: () => boolean | Promise<boolean>) {
+    for (let n = 0; n < 300; n++) { if (await check()) return; await delay(10); }
+    assert.fail('timed out waiting for WebSocket sync');
+  }
+  function subscription(id: string, session: string) {
+    const socket = new WebSocket(eventUrl(id));
+    const messages: any[] = [];
+    let code = 0;
+    socket.onopen = () => socket.send(JSON.stringify({ type: 'authenticate', token: session }));
+    socket.onmessage = event => {
+      const message = JSON.parse(String(event.data)); messages.push(message);
+      if (message.type === 'ping') socket.send('{"type":"pong"}');
+    };
+    socket.onclose = event => { code = event.code; };
+    return { socket, messages, code: () => code };
+  }
   await t.test('registration, login, duplicate names and logout enforce session lifecycle', async () => {
     assert.equal((await request('/auth/register', 'POST', credentials)).status, 409);
     assert.equal((await request('/auth/login', 'POST', { ...credentials, password: 'incorrect' })).status, 401);
@@ -91,6 +109,58 @@ test('two vaults against the real Rust server: common sync and recovery scenario
     assert.equal((await request('/vaults', 'POST', { name: 'Test vault', encryptedKey }, other.token)).status, 200);
     assert.equal((await request('/vaults', 'POST', { name: 'hack', encryptedKey, ownerId: account.userId }, other.token)).status, 422);
     assert.equal((await request(`/vaults/${vaultId}/state`)).status, 401);
+  });
+  await t.test('WebSocket subscriptions reject missing sessions and cross-user vault access', async () => {
+    const other = await (await request('/auth/register', 'POST', { username: 'push-other', password: 'other-account-password' })).json();
+    for (const [id, session, code] of [[vaultId, '', 4401], [vaultId, other.token, 4404], ['unregistered', token, 4404]] as const) {
+      const sub = subscription(id, session);
+      try {
+        await until(() => sub.code() !== 0);
+        assert.equal(sub.code(), code);
+        assert.deepEqual(sub.messages, [], 'no ready or metadata before authorization');
+      } finally { sub.socket.close(); }
+    }
+  });
+  await t.test('committed changes notify only their vault and logout closes only the revoked session', async () => {
+    const otherVault = await (await request('/vaults', 'POST', { name: 'Push isolation', encryptedKey }, token)).json();
+    const login = await (await request('/auth/login', 'POST', credentials)).json();
+    const sub = subscription(vaultId, login.token);
+    const isolated = subscription(otherVault.id, token);
+    try {
+      await until(() => [sub, isolated].every(s => s.messages.some(m => m.type === 'ready')));
+      await a.put('push-notification.md', 'committed data'); await a.engine.sync();
+      await until(() => sub.messages.some(m => m.type === 'changed'));
+      const message = sub.messages.find(m => m.type === 'changed');
+      assert.deepEqual(Object.keys(message).sort(), ['sequence', 'type']);
+      const changes = await (await request(`/vaults/${vaultId}/changes?after=0`, 'GET', undefined, token)).json();
+      assert.ok(changes.currentSequence >= message.sequence, 'notification follows durable commit');
+      await request('/auth/logout', 'POST', undefined, login.token);
+      await until(() => sub.code() === 4401);
+      assert.equal(isolated.code(), 0);
+      assert.ok(!isolated.messages.some(m => m.type === 'changed'));
+    } finally { sub.socket.close(); isolated.socket.close(); }
+  });
+  await t.test('push alone syncs an idle device, and reconnect catches changes missed offline', async () => {
+    let queue = Promise.resolve();
+    let pulls = 0;
+    let failure: unknown;
+    const notifications = new RemoteNotifications(() => {
+      pulls++;
+      queue = queue.then(() => b.engine.sync()).then(() => {}).catch(error => { failure = error; });
+    }, () => { failure = Error('unexpected notification rejection'); });
+    const connection = { url: eventUrl(vaultId), token };
+    try {
+      notifications.configure(connection);
+      await until(() => pulls > 0); await queue;
+      await a.put('pushed.md', 'without polling'); await a.engine.sync();
+      await until(async () => await b.exists('pushed.md') && await b.read('pushed.md') === 'without polling');
+      notifications.stop(); await queue;
+      await a.put('pushed.md', 'while disconnected'); await a.engine.sync();
+      assert.equal(await b.read('pushed.md'), 'without polling');
+      notifications.configure(connection);
+      await until(async () => await b.read('pushed.md') === 'while disconnected');
+      assert.equal(failure, undefined);
+    } finally { notifications.stop(); await queue; }
   });
   const settle = async () => { await a.engine.sync(); await b.engine.sync(); await a.engine.sync(); await b.engine.sync(); };
   await t.test('new device bootstraps remote data without a local edit', async () => {
@@ -213,7 +283,7 @@ test('failed encrypted migration keeps legacy credentials recoverable', async ()
 
 test('startup stays locked and never rewrites legacy plaintext until migration', async () => {
   const events = new Map<string, () => void>(); const intervals: (() => void)[] = [];
-  (globalThis as any).window = { setInterval: (fn: () => void) => { intervals.push(fn); return 1; }, clearTimeout: () => {} };
+  (globalThis as any).window = { setInterval: (fn: () => void, ms: number) => { assert.equal(ms, 60000); intervals.push(fn); return 1; }, clearTimeout: () => {} };
   (globalThis as any).document = { visibilityState: 'visible' };
   const plugin = new EncryptedSyncPlugin() as any;
   let saves = 0; let runs = 0;
@@ -227,4 +297,5 @@ test('startup stays locked and never rewrites legacy plaintext until migration',
   await plugin.onload(); intervals[0](); events.get('online')!(); events.get('focus')!();
   assert.equal(runs, 0); assert.equal(saves, 0); assert.equal(plugin.isLocked, true);
   assert.equal(plugin.data.settings.rootKey, ''); assert.equal(plugin.data.settings.token, '');
+  plugin.onunload();
 });
