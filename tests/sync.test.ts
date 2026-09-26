@@ -45,8 +45,8 @@ test('two vaults against the real Rust server: common sync and recovery scenario
   const port = (socket.address() as any).port;
   await new Promise<void>(r => socket.close(() => r()));
   const url = `http://127.0.0.1:${port}`;
-  const legacyToken = crypto.randomUUID();
-  const server = spawn(resolve('../obsidian_sync_server/target/debug/obsidian-backup-server'), [], { env: { ...process.env, OBS_BACKUP_TOKEN: legacyToken, OBS_BACKUP_LISTEN: `127.0.0.1:${port}`, OBS_BACKUP_DATA_DIR: join(root, 'server'), RUST_LOG: 'error' }, stdio: 'ignore' });
+  await writeFile(join(root, 'setting.toml'), `[server]\nlisten = "127.0.0.1:${port}"\ndata_dir = "${join(root, 'server').replaceAll('\\', '\\\\')}"\n\n[logging]\nfilter = "error"\n`);
+  const server = spawn(resolve('../obsidian_sync_server/target/debug/obsidian-backup-server'), [], { cwd: root, stdio: 'ignore' });
   t.after(async () => { interceptRequest(); server.kill(); await rm(root, { recursive: true, force: true }); });
   for (let n = 0; ; n++) { try { await fetch(url + '/api/v1/health'); break; } catch (e) { if (n > 100) throw e; await delay(30); } }
   async function request(path: string, method = 'GET', body?: unknown, token?: string) {

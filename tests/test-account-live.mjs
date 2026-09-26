@@ -33,7 +33,8 @@ try {
     await writeFile(join(dir,'本地笔记-'+side+'.md'),'来自 '+side+' 的本地测试笔记',{flag:'wx'}).catch(e=>{if(e.code!=='EEXIST')throw e;});
   }
   await writeFile(join(directory,'README.md'),`# 账户流程测试\n\n仅用于本机测试，不存放真实笔记。\n服务器：${url}\n测试用户名：${username}\n测试登录密码：${accountPassword}\n测试仓库加密/本地解锁密码：${vaultPassword}\n这些是公开的测试凭据，不能用于实际账户。Vault 根密钥和会话仍然只以密文保存。\n`);
-  server=spawn(join(root,'obsidian_sync_server/target/debug/obsidian-backup-server'),[],{env:{...process.env,OBS_BACKUP_DATA_DIR:join(directory,'server-data'),OBS_BACKUP_LISTEN:'127.0.0.1:18788',RUST_LOG:'error'},stdio:'ignore'});
+  await writeFile(join(directory,'setting.toml'),`[server]\nlisten = "127.0.0.1:18788"\ndata_dir = "${join(directory,'server-data').replaceAll('\\','\\\\')}"\n\n[logging]\nfilter = "error"\n`);
+  server=spawn(join(root,'obsidian_sync_server/target/debug/obsidian-backup-server'),[],{cwd:directory,stdio:'ignore'});
   await until(async()=> (await fetch(url+'/api/v1/health')).ok,'server');
   for(const side of ['A','B']) {
     await run('obsidian',['eval',`code=window.electron.ipcRenderer.sendSync("vault-open", ${JSON.stringify(join(directory,names[side]))}, false)`]);
